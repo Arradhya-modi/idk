@@ -1,0 +1,697 @@
+import os
+import tempfile
+import base64
+import streamlit as st
+import pdfplumber
+import faiss
+import numpy as np
+import openai
+import zipfile
+
+# 🚩🚩🚩 ADD YOUR OPENAI API KEY HERE 🚩🚩🚩
+OPENAI_API_KEY =I KEY HERE
+
+# Set the API key for OpenAI
+openai.api_key = OPENAI_API_KEY
+
+# Page configuration
+st.set_page_config(page_title="PDF Buddy", page_icon="📄🤖", layout="wide")
+
+# System prompt for kid-friendly responses
+SYSTEM_PROMPT = (
+    "You are ChatPDF Junior, a helpful assistant that answers questions about PDF documents. "
+    "Answer briefly in kid-friendly terms using simple language. "
+    "Use only the provided context from the PDF. "
+    "If the information is not found in the context, say 'Sorry, I can't find that information in the document.'"
+)
+
+# Initialize session state
+def init_state():
+    """Initialize all session state variables"""
+    if 'user' not in st.session_state:
+        st.session_state.user = "Guest"
+    if 'history' not in st.session_state:
+        st.session_state.history = []
+    if 'show_history' not in st.session_state:
+        st.session_state.show_history = False
+    if 'pdf_path' not in st.session_state:
+        st.session_state.pdf_path = None
+    if 'page' not in st.session_state:
+        st.session_state.page = 1
+    if 'chunks' not in st.session_state:
+        st.session_state.chunks = None
+    if 'index' not in st.session_state:
+        st.session_state.index = None
+
+init_state()
+
+# Sidebar for user management and settings
+def render_sidebar():
+    """Render the sidebar with login and history"""
+    st.sidebar.title("PDF Buddy Settings")
+    
+    # Show API key status (without revealing the key)
+    if OPENAI_API_KEY and OPENAI_API_KEY != "your-openai-api-key-here":
+        st.sidebar.success("✅ API Key is configured")
+    else:
+        st.sidebar.error("❌ API Key not configured")
+        st.sidebar.info("🚩 Please add your OpenAI API key to the code")
+    
+    st.sidebar.markdown("---")
+    
+    # Login section
+    login_type = st.sidebar.radio("Login as:", ["Guest", "Username/Password"])
+    
+    if login_type == "Username/Password":
+        username = st.sidebar.text_input("Username", key="user_input")
+        password = st.sidebar.text_input("Password", type="password", key="password_input")
+        
+        if st.sidebar.button("Login", key="login_btn"):
+            if username and password:
+                st.session_state.user = username
+                st.sidebar.success(f"Welcome, {username}!")
+            else:
+                st.sidebar.error("Please enter both username and password.")
+    else:
+        st.session_state.user = "Guest"
+        st.sidebar.info("Continuing as Guest")
+    
+    st.sidebar.markdown(f"**Current User:** {st.session_state.user}")
+    
+    # History toggle
+    if st.sidebar.button("🕘 Toggle Chat History", key="history_toggle"):
+        st.session_state.show_history = not st.session_state.show_history
+    
+    # Display history
+    if st.session_state.show_history and st.session_state.history:
+        st.sidebar.markdown("---")
+        st.sidebar.subheader("🕘 Recent Chat History")
+        for i, (question, answer) in enumerate(reversed(st.session_state.history[-5:]), 1):
+            with st.sidebar.expander(f"Q{i}: {question[:30]}..."):
+                st.markdown(f"**Q:** {question}")
+                st.markdown(f"**A:** {answer}")
+
+def extract_text_from_pdf(pdf_path):
+    """Extract text from PDF and create chunks for indexing"""
+    chunks = []
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            for page_num, page in enumerate(pdf.pages, 1):
+                text = page.extract_text()
+                if text:
+                    # Clean and split text into chunks
+                    words = text.split()
+                    # Create larger overlapping chunks of 300 words with 100 word overlap
+                    chunk_size = 300
+                    overlap = 100
+                    
+                    for i in range(0, len(words), chunk_size - overlap):
+                        chunk_text = " ".join(words[i:i + chunk_size])
+                        if chunk_text.strip():
+                            chunks.append({
+                                "page": page_num,
+                                "text": chunk_text.strip()
+                            })
+    except Exception as e:
+        st.error(f"Error extracting text from PDF: {str(e)}")
+        return []
+    
+    return chunks
+
+def extract_text_from_zip(zip_path):
+    """Extract PDF files from a ZIP file and return their text chunks"""
+    chunks = []
+    try:
+        with zipfile.ZipFile(zip_path, 'r') as zip_file:
+            pdf_files = [f for f in zip_file.namelist() if f.endswith('.pdf')]
+            for pdf_file in pdf_files:
+                with zip_file.open(pdf_file) as f:
+                    with pdfplumber.open(f) as pdf:
+                        for page_num, page in enumerate(pdf.pages, 1):
+                            text = page.extract_text()
+                            if text:
+                                words = text.split()
+                                chunk_size = 300
+                                overlap = 100
+                                
+                                for i in range(0, len(words), chunk_size - overlap):
+                                    chunk_text = " ".join(words[i:i + chunk_size])
+                                    if chunk_text.strip():
+                                        chunks.append({
+                                            "page": page_num,
+                                            "text": chunk_text.strip(),
+                                            "source": pdf_file  # Keep track of the source PDF file
+                                        })
+    except Exception as e:
+        st.error(f"Error extracting text from ZIP: {str(e)}")
+        return []
+    
+    return chunks
+
+def create_embeddings(texts):
+    """Create embeddings using OpenAI API"""
+    try:
+        # Handle both single string and list of strings
+        if isinstance(texts, str):
+            texts = [texts]
+
+        response = openai.Embedding.create(
+            model="text-embedding-ada-002",  # Use the appropriate model for embeddings
+            input=texts
+        )
+
+        return [item['embedding'] for item in response['data']]
+    except Exception as e:
+        error_msg = str(e).lower()
+        if "authentication" in error_msg or "api key" in error_msg:
+            st.error("🚩 Invalid API key! Please check your OpenAI API key in the code.")
+        elif "rate limit" in error_msg or "quota" in error_msg:
+            st.error("Rate limit exceeded. Please wait a moment and try again.")
+        elif "api" in error_msg:
+            st.error(f"OpenAI API error: {str(e)}")
+        else:
+            st.error(f"Error creating embeddings: {str(e)}")
+        return None
+
+def build_faiss_index(chunks):
+    """Build FAISS index from text chunks"""
+    if not chunks:
+        return None, None
+    
+    texts = [chunk['text'] for chunk in chunks]
+    
+    with st.spinner("Creating embeddings..."):
+        embeddings = create_embeddings(texts)
+    
+    if embeddings is None:
+        return None, None
+    
+    # Convert to numpy array and normalize
+    embedding_matrix = np.array(embeddings, dtype='float32')
+    faiss.normalize_L2(embedding_matrix)
+    
+    # Create FAISS index
+    dimension = embedding_matrix.shape[1]
+    index = faiss.IndexFlatIP(dimension)  # Inner product for cosine similarity
+    index.add(embedding_matrix)
+    
+    return chunks, index
+
+def search_similar_chunks(query, chunks, index, k=3):
+    """Search for similar chunks using FAISS"""
+    if not chunks or not index:
+        return []
+    
+    try:
+        # Create query embedding
+        query_embedding = create_embeddings(query)
+        if query_embedding is None:
+            return []
+        
+        query_vector = np.array(query_embedding, dtype='float32')
+        faiss.normalize_L2(query_vector)
+        
+        # Search
+        scores, indices = index.search(query_vector, k)
+        
+        # Return relevant chunks
+        results = []
+        for i, idx in enumerate(indices[0]):
+            if idx < len(chunks) and scores[0][i] > 0.1:  # Minimum similarity threshold
+                results.append(chunks[idx])
+        
+        return results
+    except Exception as e:
+        st.error(f"Error searching chunks: {str(e)}")
+        return []
+
+def generate_answer(query, context_chunks):
+    """Generate answer using OpenAI GPT"""
+    if not context_chunks:
+        return "Sorry, I can't find relevant information in the document to answer your question."
+    
+    # Prepare context
+    context = "\n\n".join([chunk['text'] for chunk in context_chunks])
+    
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": f"Context from the PDF:\n{context}"},
+        {"role": "user", "content": query}
+    ]
+    
+    try:
+        response = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",  # Using gpt-3.5-turbo for affordability
+            messages=messages,
+            max_tokens=300,  # Increased token limit for more detailed responses
+            temperature=0.2  # Lower temperature for more focused answers
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        error_msg = str(e).lower()
+        if "authentication" in error_msg or "api key" in error_msg:
+            return "🚩 Invalid API key! Please check your OpenAI API key in the code."
+        elif "rate limit" in error_msg or "quota" in error_msg:
+            return "Rate limit exceeded. Please wait a moment and try again."
+        elif "api" in error_msg:
+            return f"OpenAI API error: {str(e)}"
+        else:
+            st.error(f"Error generating answer: {str(e)}")
+            return "Sorry, I encountered an error while generating the answer."
+
+def render_pdf_viewer():
+    """Render the PDF viewer column"""
+    st.subheader("📑 Upload Your PDF or ZIP")
+    
+    uploaded_file = st.file_uploader(
+        "Choose a PDF or ZIP file", 
+        type=["pdf", "zip"], 
+        key="file_uploader",
+        help="Upload a PDF document or a ZIP file containing PDFs to start chatting with it"
+    )
+    
+    if uploaded_file is not None:
+        # Save uploaded file to temporary location
+        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(uploaded_file.name)[1]) as tmp_file:
+            tmp_file.write(uploaded_file.getbuffer())
+            tmp_path = tmp_file.name
+        
+        # Update session state if new file
+        if st.session_state.pdf_path != tmp_path:
+            # Clean up old temp file if it exists
+            if st.session_state.pdf_path and os.path.exists(st.session_state.pdf_path):
+                try:
+                    os.unlink(st.session_state.pdf_path)
+                except:
+                    pass  # Ignore cleanup errors
+            
+            st.session_state.pdf_path = tmp_path
+            st.session_state.page = 1
+            st.session_state.chunks = None
+            st.session_state.index = None
+            
+            # Process PDF or ZIP
+            with st.spinner("Processing file..."):
+                if uploaded_file.type == "application/zip":
+                    chunks = extract_text_from_zip(tmp_path)
+                else:
+                    chunks = extract_text_from_pdf(tmp_path)
+                
+                if chunks and len(chunks) > 0:
+                    st.session_state.chunks, st.session_state.index = build_faiss_index(chunks)
+                    if st.session_state.chunks and st.session_state.index:
+                        st.success(f"✅ File processed successfully! Found {len(chunks)} text chunks.")
+                    else:
+                        st.error("❌ Failed to create searchable index from file.")
+                else:
+                    st.error("❌ Could not extract readable text from file. Please try a different file.")
+    
+    # Display PDF if available
+    if st.session_state.pdf_path and os.path.exists(st.session_state.pdf_path) and st.session_state.pdf_path.endswith('.pdf'):
+        try:
+            with open(st.session_state.pdf_path, "rb") as f:
+                pdf_data = f.read()
+            
+            # Encode PDF for display
+            b64_pdf = base64.b64encode(pdf_data).decode()
+            pdf_display = f'<iframe src="data:application/pdf;base64,{b64_pdf}#page={st.session_state.page}" width="100%" height="600px"></iframe>'
+            
+            st.markdown(pdf_display, unsafe_allow_html=True)
+            
+            # Navigation buttons
+            col1, col2, col3 = st.columns([1, 2, 1])
+            
+            with col1:
+                if st.button("← Previous Page", key="prev_page") and st.session_state.page > 1:
+                    st.session_state.page -= 1
+                    st.experimental_rerun()
+            
+            with col3:
+                if st.button("Next Page →", key="next_page"):
+                    st.session_state.page += 1
+                    st.experimental_rerun()
+            
+            with col2:
+                # Page input for direct navigation
+                new_page = st.number_input(
+                    "Go to page:", 
+                    min_value=1, 
+                    value=st.session_state.page,
+                    key="page_input"
+                )
+                if new_page != st.session_state.page:
+                    st.session_state.page = new_page
+                    st.experimental_rerun()
+                
+        except Exception as e:
+            st.error(f"Error displaying PDF: {str(e)}")
+
+def render_chat_interface():
+    """Render the chat interface column"""
+    st.subheader("💬 Chat with Your PDF")
+    
+    # Check if API key is configured in the code
+    if not OPENAI_API_KEY or OPENAI_API_KEY == "your-openai-api-key-here":
+        st.error("🚩 API Key not configured! Please add your OpenAI API key to the code.")
+        st.code('OPENAI_API_KEY = "your-actual-api-key-here"  # 🚩 Replace this line')
+        return
+    
+    # Check if PDF or ZIP is loaded
+    if not st.session_state.pdf_path:
+        st.info("Upload a PDF document or ZIP file to start asking questions!")
+        return
+    
+    # Check if file is processed
+    if not st.session_state.chunks or not st.session_state.index:
+        st.warning("File is still being processed. Please wait...")
+        return
+    
+    # Chat input
+    query = st.text_input(
+        "Ask a question about your PDF:", 
+        key="chat_input",
+        placeholder="e.g., What is this document about?",
+        help="Type your question and press Enter or click the Ask button"
+    )
+    
+    # Allow Enter key to submit or use button
+    ask_clicked = st.button("Ask Question", key="ask_btn", type="primary")
+    
+    if ask_clicked or (query and query != st.session_state.get('last_query', '')):
+        st.session_state.last_query = query  # Prevent double processing
+        
+        if not query.strip():
+            st.warning("Please enter a question before asking.")
+        else:
+            with st.spinner("Searching through your PDF..."):
+                # Search for relevant chunks
+                relevant_chunks = search_similar_chunks(
+                    query, 
+                    st.session_state.chunks, 
+                    st.session_state.index
+                )
+                
+                if relevant_chunks:
+                    # Generate answer
+                    with st.spinner("Generating answer..."):
+                        answer = generate_answer(query, relevant_chunks)
+                    
+                    # Display answer
+                    st.markdown("### 🤖 Answer:")
+                    st.markdown(answer)
+                    
+                    # Show source pages
+                    pages = sorted(set(chunk['page'] for chunk in relevant_chunks))
+                    st.caption(f"📍 Information found on pages: {', '.join(map(str, pages))}")
+                    
+                    # Page navigation buttons
+                    st.markdown("**Quick navigation:**")
+                    cols = st.columns(len(pages))
+                    for i, page in enumerate(pages):
+                        with cols[i]:
+                            if st.button(f"Go to Page {page}", key=f"nav_page_{page}"):
+                                st.session_state.page = page
+                                st.experimental_rerun()
+                    
+                    # Save to history if not guest
+                    if st.session_state.user != "Guest":
+                        st.session_state.history.append((query, answer))
+                        # Keep only last 10 entries
+                        if len(st.session_state.history) > 10:
+                            st.session_state.history = st.session_state.history[-10:]
+                
+                else:
+                    st.warning("I couldn't find relevant information in the document to answer your question. Try rephrasing your question or asking about different topics covered in the PDF.")
+
+def main():
+    """Main application function"""
+    # Render sidebar
+    render_sidebar()
+    
+    # Main title
+    st.title("PDF Buddy – Chat with your PDF 📖🤖")
+    st.markdown("Upload a PDF document or a ZIP file containing PDFs and ask questions about their content!")
+    
+    # Create two columns
+    col1, col2 = st.columns([1, 1])
+    
+    with col1:
+        render_pdf_viewer()
+    
+    with col2:
+        render_chat_interface()
+    
+    # Footer
+    st.markdown("---")
+    st.markdown("Made with ❤️ using Streamlit, OpenAI, and FAISS")
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+"""
+PDF Buddy – Chat with your PDFs in two-pane glory ✨
+---------------------------------------------------
+Drop any PDF on the left, ask questions on the right.
+Answers are short, kid-friendly, and source buttons navigate to the quoted page.
+
+Tech stack:
+• **pdfplumber** – extract text by page
+• **FAISS** – fast vector search
+• **OpenAI** – embeddings + GPT-4o RAG
+
+Now featuring a PNG "Tuber" that emotes based on app status!
+"""
+import os
+import tempfile
+import base64
+import zipfile
+from urllib.parse import quote_plus
+
+import streamlit as st
+import pdfplumber
+import faiss
+import numpy as np
+import openai
+from PIL import Image
+
+# 🚩 OpenAI API Key
+openai.api_key = os.getenv("OPENAI_API_KEY", "sk-...")
+
+# Load PNG Tuber faces (place these files next to your script)
+tuber_images = {
+    "idle": Image.open("ChatGPT Image May 30, 2025, 10_42_32 AM.png"),
+    "thinking": Image.open("ChatGPT Image May 30, 2025, 10_42_37 AM.png"),
+    "error": Image.open("ChatGPT Image May 30, 2025, 10_42_42 AM.png"),
+}
+
+# Page configuration
+st.set_page_config(page_title="PDF Buddy", page_icon="📄🤖", layout="wide")
+
+SYSTEM_PROMPT = (
+    "You are ChatPDF Junior. Answer briefly in kid-friendly terms. "
+    "Use only the provided context. If not found, say 'Sorry, I can't find that.'"
+)
+
+# Initialize session state
+for key, default in {
+    "user": "Guest", "history": [], "show_history": False,
+    "pdf_path": None, "page": 1, "chunks": None, "index": None,
+    "tuber_status": "idle"
+}.items():
+    st.session_state.setdefault(key, default)
+
+
+# Sidebar
+st.sidebar.title("PDF Buddy Settings")
+if openai.api_key and openai.api_key.startswith("sk-"):
+    st.sidebar.success("✅ API Key configured")
+else:
+    st.sidebar.error("❌ API Key not set!")
+
+login = st.sidebar.radio("Login as:", ["Guest", "Username/Password"])
+if login == "Username/Password":
+    u = st.sidebar.text_input("Username", key="user_input")
+    p = st.sidebar.text_input("Password", type="password", key="password_input")
+    if st.sidebar.button("Login", key="login_btn"):
+        if u and p:
+            st.session_state.user = u
+            st.sidebar.success(f"Welcome, {u}!")
+        else:
+            st.sidebar.error("Enter both username & password.")
+else:
+    st.session_state.user = "Guest"
+    st.sidebar.info("Continuing as Guest")
+
+st.sidebar.markdown(f"**Current User:** {st.session_state.user}")
+if st.sidebar.button("🕘 Toggle Chat History", key="history_toggle"):
+    st.session_state.show_history = not st.session_state.show_history
+if st.session_state.show_history and st.session_state.history:
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("🕘 Recent Chat History")
+    for i, (q, a) in enumerate(reversed(st.session_state.history[-10:]), 1):
+        with st.sidebar.expander(f"Q{i}: {q[:30]}..."):
+            st.markdown(f"**Q:** {q}")
+            st.markdown(f"**A:** {a}")
+
+
+# Title and columns
+title_col, chat_col = st.columns([1, 1])
+with title_col:
+    st.title("PDF Buddy – Chat with your PDF 📖🤖")
+
+with chat_col:
+    # Display tuber emoting
+    st.image(tuber_images[st.session_state.tuber_status], width=150)
+
+col1, col2 = st.columns(2)
+
+# PDF viewer
+with col1:
+    st.subheader("📑 Upload PDF or ZIP")
+    uploaded = st.file_uploader("Choose PDF/ZIP", type=["pdf", "zip"], key="file_uploader")
+    if uploaded:
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(uploaded.name)[1])
+        tmp.write(uploaded.getbuffer())
+        tmp.flush()
+        st.session_state.pdf_path = tmp.name
+        st.session_state.page = 1
+        st.session_state.chunks = None
+        st.session_state.index = None
+    # Display PDF
+    if st.session_state.pdf_path and st.session_state.pdf_path.endswith('.pdf'):
+        with open(st.session_state.pdf_path, 'rb') as f:
+            data = f.read()
+        b64 = base64.b64encode(data).decode()
+        iframe = f'<iframe src="data:application/pdf;base64,{b64}#page={st.session_state.page}" width="100%" height="600px"></iframe>'
+        st.markdown(iframe, unsafe_allow_html=True)
+        pcol, _, ncol = st.columns([1, 2, 1])
+        with pcol:
+            if st.button("← Prev", key="prev_page") and st.session_state.page > 1:
+                st.session_state.page -= 1
+                st.experimental_rerun()
+        with ncol:
+            if st.button("Next →", key="next_page"):
+                st.session_state.page += 1
+                st.experimental_rerun()
+
+
+# Chat & Retrieval
+with col2:
+    st.subheader("💬 Ask your PDF")
+    query = st.text_input("Your question…", key="chat_input")
+
+    @st.cache_data(show_spinner=False)
+    def build_index(path):
+        chunks = []
+        try:
+            # Using repair=True to attempt fixes in PDF structure
+            with pdfplumber.open(path, repair=True) as pdf:
+                for pg in pdf.pages:
+                    txt = pg.extract_text() or ""
+                    words = txt.split()
+                    for i in range(0, len(words), 200):
+                        c = " ".join(words[i:i + 200])
+                        if c:
+                            chunks.append({"page": pg.page_number, "text": c})
+        except Exception as e:
+            st.session_state.tuber_status = "error"
+            st.warning(f"Error opening PDF: {str(e)}")
+            return [], None
+
+        texts = [c["text"] for c in chunks]
+        if not texts:
+            st.session_state.tuber_status = "error"
+            st.warning("No text chunks extracted from PDF.")
+            return [], None
+
+        try:
+            embs = openai.Embedding.create(model="text-embedding-ada-002", input=texts).data
+        except Exception as e:
+            st.session_state.tuber_status = "error"
+            st.warning(f"Error generating embeddings: {str(e)}")
+            return [], None
+
+        mat = np.array([e['embedding'] for e in embs], dtype="float32")
+        faiss.normalize_L2(mat)
+        idx = faiss.IndexFlatIP(mat.shape[1])
+        idx.add(mat)
+        return chunks, idx
+
+    if st.button("Ask", key="ask_btn"):
+        if not query.strip():
+            st.warning("Enter a question before asking.")
+        else:
+            st.session_state.tuber_status = "thinking"
+            chunks, idx = build_index(st.session_state.pdf_path)
+            if idx is None:
+                # An error occurred, already warned
+                pass
+            else:
+                with st.spinner("Searching… 🤖"):
+                    try:
+                        qv = openai.Embedding.create(model="text-embedding-ada-002", input=[query]).data[0]['embedding']
+                    except Exception as e:
+                        st.session_state.tuber_status = "error"
+                        st.warning(f"Error generating query embedding: {str(e)}")
+                        qv = None
+
+                if qv is not None:
+                    vec = np.array([qv], dtype="float32")
+                    faiss.normalize_L2(vec)
+                    _, I = idx.search(vec, 3)
+                    hits = [chunks[i] for i in I[0] if i < len(chunks)]
+
+                    ctx = "\n\n".join(h["text"] for h in hits)
+                    if not ctx.strip():
+                        st.session_state.tuber_status = "error"
+                        st.warning("Sorry, I can't find that.")
+                    else:
+                        with st.spinner("Generating answer… 🤖"):
+                            try:
+                                resp = openai.chat.completions.create(
+                                    model="gpt-4o-mini",
+                                    messages=[
+                                        {"role": "system", "content": SYSTEM_PROMPT},
+                                        {"role": "system", "content": f"Context:\n{ctx}"},
+                                        {"role": "user", "content": query},
+                                    ],
+                                    max_tokens=150,
+                                    temperature=0.3,
+                                )
+                                ans = resp.choices[0].message.content.strip()
+                            except Exception as e:
+                                st.session_state.tuber_status = "error"
+                                st.warning(f"Error generating answer: {str(e)}")
+                                ans = None
+
+                        if ans:
+                            st.session_state.tuber_status = "idle"
+                            st.markdown(f"**Answer:** {ans}")
+                            pages = sorted({h["page"] for h in hits})
+                            st.caption(f"📍 Pages: {', '.join(map(str, pages))}")
+                            if st.session_state.user != "Guest":
+                                st.session_state.history.append((query, ans))
+                            for p in pages:
+                                if st.button(f"Go to page {p}", key=f"go_{p}"):
+                                    st.session_state.page = p
+                                    st.experimental_rerun()
+                        else:
+                            st.session_state.tuber_status = "error"
+
+# Footer
+st.markdown("---")
+st.markdown("Made with ❤️ using Streamlit, OpenAI, and FAISS")
